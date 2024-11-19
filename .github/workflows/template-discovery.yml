@@ -1,0 +1,272 @@
+# .github/workflows/template-discovery.yml
+name: Next.js Template Discovery and Sync
+
+on:
+  schedule:
+    - cron: '0 0 * * *'  # Daily at midnight
+    - cron: '0 12 * * *' # Daily at noon for different timezone coverage
+  workflow_dispatch:
+    inputs:
+      force_update:
+        description: 'Force update all templates'
+        type: boolean
+        default: false
+      min_stars:
+        description: 'Minimum stars for template consideration'
+        type: number
+        default: 100
+
+env:
+  TEMPLATE_DIR: discovered-templates
+  ANALYSIS_DIR: template-analysis
+  MIN_STARS: ${{ github.event.inputs.min_stars || 100 }}
+  MAX_TEMPLATES: 20
+  GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+jobs:
+  discover-templates:
+    runs-on: ubuntu-latest
+    
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v3
+        
+      - name: Setup Node.js
+        uses: actions/setup-node@v3
+        with:
+          node-version: '18'
+          
+      - name: Install Dependencies
+        run: |
+          npm install -g typescript
+          npm install @octokit/rest @octokit/graphql-schema
+          
+      - name: Create Analysis Script
+        run: |
+          cat > analyze-template.js <<EOL
+          const { Octokit } = require('@octokit/rest');
+          const octokit = new Octokit({ auth: process.env.GITHUB_TOKEN });
+
+          async function analyzeRepository(repo) {
+            const files = await octokit.repos.getContent({
+              owner: repo.owner.login,
+              repo: repo.name,
+              path: ''
+            });
+
+            const hasNextConfig = files.data.some(f => f.name === 'next.config.js');
+            const hasPackageJson = files.data.some(f => f.name === 'package.json');
+            
+            if (!hasNextConfig || !hasPackageJson) return null;
+
+            const packageJson = await octokit.repos.getContent({
+              owner: repo.owner.login,
+              repo: repo.name,
+              path: 'package.json'
+            });
+
+            const content = JSON.parse(Buffer.from(packageJson.data.content, 'base64').toString());
+            
+            return {
+              name: repo.name,
+              owner: repo.owner.login,
+              stars: repo.stargazers_count,
+              description: repo.description,
+              dependencies: content.dependencies || {},
+              devDependencies: content.devDependencies || {},
+              hasTypescript: files.data.some(f => f.name === 'tsconfig.json'),
+              hasTests: files.data.some(f => f.name.includes('test') || f.name.includes('jest')),
+              hasTailwind: content.dependencies?.['tailwindcss'] || content.devDependencies?.['tailwindcss'],
+              lastUpdate: repo.pushed_at,
+              license: repo.license?.spdx_id,
+              topics: repo.topics || []
+            };
+          }
+
+          module.exports = { analyzeRepository };
+          EOL
+
+      - name: Create Template Discovery Script
+        run: |
+          cat > discover-templates.js <<EOL
+          const { Octokit } = require('@octokit/rest');
+          const { analyzeRepository } = require('./analyze-template.js');
+          const fs = require('fs').promises;
+
+          async function discoverTemplates() {
+            const octokit = new Octokit({ auth: process.env.GITHUB_TOKEN });
+            const templates = new Set();
+            
+            // Search for Next.js templates
+            const searchQueries = [
+              'nextjs template stars:>100',
+              'next.js starter stars:>100',
+              'next.js boilerplate stars:>100',
+              'nextjs typescript template stars:>100'
+            ];
+
+            for (const query of searchQueries) {
+              const result = await octokit.search.repos({
+                q: query,
+                sort: 'stars',
+                per_page: 50
+              });
+
+              for (const repo of result.data.items) {
+                if (templates.size >= process.env.MAX_TEMPLATES) break;
+                
+                const analysis = await analyzeRepository(repo);
+                if (analysis && analysis.stars >= process.env.MIN_STARS) {
+                  templates.add(JSON.stringify(analysis));
+                }
+              }
+            }
+
+            // Get trending repositories
+            const trending = await octokit.search.repos({
+              q: 'nextjs created:>2023-01-01 stars:>500',
+              sort: 'stars',
+              order: 'desc',
+              per_page: 20
+            });
+
+            for (const repo of trending.data.items) {
+              if (templates.size >= process.env.MAX_TEMPLATES) break;
+              
+              const analysis = await analyzeRepository(repo);
+              if (analysis) {
+                templates.add(JSON.stringify(analysis));
+              }
+            }
+
+            return Array.from(templates).map(t => JSON.parse(t));
+          }
+
+          async function main() {
+            const templates = await discoverTemplates();
+            await fs.writeFile('template-analysis.json', JSON.stringify(templates, null, 2));
+          }
+
+          main().catch(console.error);
+          EOL
+
+      - name: Discover Templates
+        run: |
+          node discover-templates.js
+          
+      - name: Analyze Templates
+        run: |
+          mkdir -p ${{ env.ANALYSIS_DIR }}
+          if [ -f template-analysis.json ]; then
+            mv template-analysis.json ${{ env.ANALYSIS_DIR }}/
+            
+            # Generate summary report
+            cat > ${{ env.ANALYSIS_DIR }}/summary.md <<EOL
+            # Next.js Template Analysis Report
+            
+            Generated on $(date)
+            
+            ## Discovered Templates
+            
+            $(jq -r '.[] | "* [\(.name)](\(.html_url)) - \(.stars) ⭐ - \(.description)"' ${{ env.ANALYSIS_DIR }}/template-analysis.json)
+            
+            ## Technology Distribution
+            
+            $(jq -r '[.[] | select(.hasTypescript)] | length' ${{ env.ANALYSIS_DIR }}/template-analysis.json) templates use TypeScript
+            $(jq -r '[.[] | select(.hasTailwind)] | length' ${{ env.ANALYSIS_DIR }}/template-analysis.json) templates use Tailwind CSS
+            $(jq -r '[.[] | select(.hasTests)] | length' ${{ env.ANALYSIS_DIR }}/template-analysis.json) templates include tests
+            
+            ## Recent Updates
+            
+            Most recently updated templates:
+            $(jq -r '. | sort_by(.lastUpdate) | reverse | .[0:5] | .[] | "* \(.name) - \(.lastUpdate)"' ${{ env.ANALYSIS_DIR }}/template-analysis.json)
+            EOL
+          fi
+
+      - name: Clone Selected Templates
+        run: |
+          mkdir -p ${{ env.TEMPLATE_DIR }}
+          
+          if [ -f ${{ env.ANALYSIS_DIR }}/template-analysis.json ]; then
+            while IFS= read -r template; do
+              owner=$(echo $template | jq -r '.owner')
+              repo=$(echo $template | jq -r '.name')
+              
+              echo "Cloning $owner/$repo..."
+              git clone https://github.com/$owner/$repo.git ${{ env.TEMPLATE_DIR }}/$repo
+              
+              # Remove git history to save space
+              rm -rf ${{ env.TEMPLATE_DIR }}/$repo/.git
+              
+              # Create template metadata
+              cat > ${{ env.TEMPLATE_DIR }}/$repo/template-info.json <<EOL
+              $template
+          EOL
+            done < <(jq -c '.[]' ${{ env.ANALYSIS_DIR }}/template-analysis.json)
+          fi
+
+      - name: Generate Template Categories
+        run: |
+          mkdir -p categories
+          
+          # Categorize templates based on features and dependencies
+          jq -r '.[] | select(.dependencies["@chakra-ui/react"] or .dependencies["@mui/material"]) | .name' \
+            ${{ env.ANALYSIS_DIR }}/template-analysis.json > categories/ui-frameworks.txt
+            
+          jq -r '.[] | select(.hasTypescript) | .name' \
+            ${{ env.ANALYSIS_DIR }}/template-analysis.json > categories/typescript.txt
+            
+          jq -r '.[] | select(.hasTailwind) | .name' \
+            ${{ env.ANALYSIS_DIR }}/template-analysis.json > categories/tailwind.txt
+            
+          jq -r '.[] | select(.dependencies["@apollo/client"] or .dependencies["graphql"]) | .name' \
+            ${{ env.ANALYSIS_DIR }}/template-analysis.json > categories/graphql.txt
+
+      - name: Create Template Registry
+        run: |
+          cat > template-registry.json <<EOL
+          {
+            "lastUpdated": "$(date -u +"%Y-%m-%dT%H:%M:%SZ")",
+            "templates": $(cat ${{ env.ANALYSIS_DIR }}/template-analysis.json),
+            "categories": {
+              "ui-frameworks": $(cat categories/ui-frameworks.txt | jq -R . | jq -s .),
+              "typescript": $(cat categories/typescript.txt | jq -R . | jq -s .),
+              "tailwind": $(cat categories/tailwind.txt | jq -R . | jq -s .),
+              "graphql": $(cat categories/graphql.txt | jq -R . | jq -s .)
+            }
+          }
+          EOL
+
+      - name: Update Repository
+        run: |
+          # Update template directory
+          git config --global user.name 'GitHub Actions Bot'
+          git config --global user.email 'actions@github.com'
+          
+          git add ${{ env.TEMPLATE_DIR }}
+          git add ${{ env.ANALYSIS_DIR }}
+          git add categories
+          git add template-registry.json
+          
+          if git diff --staged --quiet; then
+            echo "No changes to commit"
+          else
+            git commit -m "chore: Update discovered Next.js templates [skip ci]"
+            git push origin main
+          fi
+
+      - name: Create Analysis Report PR
+        uses: peter-evans/create-pull-request@v5
+        with:
+          title: 'docs: Update template analysis report'
+          commit-message: 'docs: Update template analysis report'
+          branch: template-analysis-update
+          delete-branch: true
+          body: |
+            This PR updates the template analysis report with newly discovered Next.js templates.
+            
+            ## Summary
+            - Total templates analyzed: $(jq '. | length' ${{ env.ANALYSIS_DIR }}/template-analysis.json)
+            - New templates discovered: $(git diff --numstat | grep template-analysis.json | cut -f1)
+            
+            Please review the changes in ${{ env.ANALYSIS_DIR }}/summary.md for detailed analysis.
